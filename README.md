@@ -10,6 +10,7 @@ First applied to TH_dneo on 2026-10-11.
 | `/root/scripts/contractcheck.pl` | Counts the PostgreSQL database in storage usage. The original only looked in fixed paths (`/var/lib/pgsql16/data` and similar), so servers with PostgreSQL elsewhere (for example `/var/pgsql/data`) under-reported usage. It now asks the running PostgreSQL for its data directory (`-D`), falling back to the old paths. |
 | `/var/www/html/diskuse.cgi` | Redesigned customer storage page: usage bar, Normal / Approaching limit / Exceeded status, usage by app (with a "Database & other data" row), UTC+0 timestamps, mobile and dark-mode support. |
 | `/var/www/html/contract/index.cgi` | Redesigned administrator page: customer name and allocated size form, usage summary, 7-day history. Alert threshold and contract type are no longer shown, but are kept when saving. Shows an "Only for internal use" banner. |
+| root's crontab (certbot line) | Fixes the broken schedule `* */12 * * *`, which runs certbot every minute for an hour twice a day (120 runs, landing in the 08:00 morning rush for UTC+7/+8 customers). It becomes `30 4,16 * * * /usr/bin/certbot renew -q >/dev/null 2>&1` (04:30 and 16:30 UTC). Only that exact broken pattern is replaced. Lines that are already correct or customised are left alone. |
 
 The calculations, the alert rule and the save behaviour are unchanged. Nothing is customer-specific: the customer name and allocation come from each server's `contract/.data`.
 
@@ -33,6 +34,9 @@ Options:
 
 - `--dry-run`: show what would change, change nothing.
 - `--no-run`: install only; don't run the usage check now (it runs daily at 06:00 UTC anyway).
+- `--skip-certbot`: leave root's crontab untouched.
+
+The certbot fix backs up root's crontab first. After writing, it re-reads the crontab, and if the fix isn't there it restores the original.
 
 For each file, the script skips it if it's missing or already up to date. Otherwise it tests the new version with that server's Perl (CGI pages are test-run as the web server user), backs up the current file to `/root/backup-storage-update-<time>/`, and replaces it, keeping the owner and permissions. Locally modified versions are also replaced; check the dry run first. At the end it prints a summary and the exact rollback commands.
 

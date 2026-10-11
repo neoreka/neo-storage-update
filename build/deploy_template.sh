@@ -7,24 +7,29 @@
 #                                         (auto-detects the running data dir)
 #   2. /var/www/html/diskuse.cgi        - redesigned customer storage page (UTC+0)
 #   3. /var/www/html/contract/index.cgi - redesigned administrator page
-#   4. Runs contractcheck.pl once so both pages show corrected usage now
+#   4. root crontab: fixes the broken certbot schedule "* */12 * * *" (runs every
+#      minute for an hour, twice a day) to "30 4,16 * * *" (04:30 and 16:30 UTC)
+#   5. Runs contractcheck.pl once so both pages show corrected usage now
 #
 # Usage (on the server):   sudo bash deploy_storage_update.sh
-#   --no-run      install only; don't run contractcheck.pl now
-#   --dry-run     check everything and show what would change; change nothing
+#   --no-run        install only; don't run contractcheck.pl now
+#   --skip-certbot  leave the root crontab untouched
+#   --dry-run       check everything and show what would change; change nothing
 #
-# Every replaced file is backed up first to /root/backup-<timestamp>/.
+# Every replaced file (and the crontab) is backed up first to /root/backup-<timestamp>/.
 # Existing owner and permissions of each file are kept.
 # =============================================================================
 set -u
 
 RUN_CHECK=1
 DRY_RUN=0
+FIX_CERTBOT=1
 for a in "$@"; do
   case "$a" in
-    --no-run)  RUN_CHECK=0 ;;
-    --dry-run) DRY_RUN=1 ;;
-    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
+    --no-run)       RUN_CHECK=0 ;;
+    --skip-certbot) FIX_CERTBOT=0 ;;
+    --dry-run)      DRY_RUN=1 ;;
+    -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
     *) echo "Unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -136,6 +141,53 @@ install_file() {
 install_file "$WORK/contractcheck.pl" /root/scripts/contractcheck.pl   "Usage check script" 0 /
 install_file "$WORK/diskuse.cgi"      /var/www/html/diskuse.cgi        "Customer page"      1 /var/www/html
 install_file "$WORK/index.cgi"        /var/www/html/contract/index.cgi "Admin page"         1 /var/www/html/contract
+
+# ---- fix the certbot schedule in root's crontab -----------------------------------
+# "* */12 * * *" means every minute during hours 00 and 12 (120 runs a day, piling up
+# in the morning business hours of UTC+7/+8 customers). Replace it with two runs a day.
+CERTBOT_GOOD='30 4,16 * * * /usr/bin/certbot renew -q >/dev/null 2>&1'
+CERTBOT_BAD_RE='^\*[[:space:]]+\*/12[[:space:]]+\*[[:space:]]+\*[[:space:]]+\*[[:space:]]+.*certbot[[:space:]]+renew'
+fix_certbot() {
+  local cur new
+  if ! cur=$(crontab -l 2>/dev/null); then
+    skip "certbot schedule: root has no crontab"
+    return
+  fi
+  if ! grep -q 'certbot' <<<"$cur"; then
+    skip "certbot schedule: no certbot line in root's crontab"
+    return
+  fi
+  if ! grep -Eq "$CERTBOT_BAD_RE" <<<"$cur"; then
+    skip "certbot schedule: already OK or customised (left as is): $(grep -m1 certbot <<<"$cur")"
+    return
+  fi
+  local line
+  new=$(while IFS= read -r line; do
+          if [[ $line =~ $CERTBOT_BAD_RE ]]; then printf '%s\n' "$CERTBOT_GOOD"; else printf '%s\n' "$line"; fi
+        done <<<"$cur")
+  if [ $DRY_RUN -eq 1 ]; then
+    ok "certbot schedule: would change to '$CERTBOT_GOOD'"
+    return
+  fi
+  mkdir -p "$BACKUP" && chmod 700 "$BACKUP"
+  printf '%s\n' "$cur" > "$BACKUP/root.crontab"
+  if printf '%s\n' "$new" | crontab -; then
+    # verify: the fixed line is there and the broken one is gone, otherwise put the original back
+    cur=$(crontab -l 2>/dev/null)
+    if grep -qxF "$CERTBOT_GOOD" <<<"$cur" && ! grep -Eq "$CERTBOT_BAD_RE" <<<"$cur"; then
+      ROLLBACK+=("crontab '$BACKUP/root.crontab'")
+      ok "certbot schedule: changed to '$CERTBOT_GOOD'"
+    else
+      crontab "$BACKUP/root.crontab"
+      fail "certbot schedule: verification failed, original crontab restored"
+    fi
+  else
+    fail "certbot schedule: could not write root's crontab (unchanged)"
+  fi
+}
+if [ $FIX_CERTBOT -eq 1 ]; then
+  fix_certbot
+fi
 
 # ---- run the usage check once ---------------------------------------------------
 USAGE=/var/www/html/contract/.usage
