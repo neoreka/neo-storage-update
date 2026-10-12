@@ -12,6 +12,7 @@ First applied to TH_dneo on 2026-10-11.
 | `/var/www/html/contract/index.cgi` | Redesigned administrator page: customer name and allocated size form, usage summary, 7-day history. Alert threshold and contract type are no longer shown, but are kept when saving. Shows an "Only for internal use" banner. |
 | root's crontab (certbot line) | Fixes the broken schedule `* */12 * * *`, which runs certbot every minute for an hour twice a day (120 runs, landing in the 08:00 morning rush for UTC+7/+8 customers). It becomes `30 4,16 * * * /usr/bin/certbot renew -q >/dev/null 2>&1` (04:30 and 16:30 UTC). Only that exact broken pattern is replaced. Lines that are already correct or customised are left alone. |
 | root's crontab (usage check line) | Moves the daily `contractcheck.pl` run to 22:00 UTC, which is 05:00 in Thailand (UTC+7) and 06:00 in Malaysia and the Philippines (UTC+8), so usage is fresh before the working day. Only the time changes; the command is kept. If the server clock isn't UTC, the hour is converted to it. Commented-out lines are left alone. |
+| Apache `httpd.conf` (security setting) | Applies the vendor's [Apache security setting](https://www.desknets.com/neo/download/doc/install/security_linux_setting_apache_202608.html): four `LocationMatch` blocks appended to the end of `httpd.conf`, word for word, that block web access to NEO folders and files that must not be public (`dneoopt`, `dneo/data`, `file`, `wmldata`, `dump`, `tmp`, `log`, `tools`, script files and batch programs such as `zbat*` and `wsserver`). Apache 2.2 gets the vendor's 2.2 syntax. The script runs the config test and reloads Apache. It then checks that the NEO login page answers exactly as before and that the blocked paths answer 403. If anything fails, `httpd.conf` is put back and Apache reloaded. Skipped if the setting is already there: added by this script, or by hand anywhere in `conf/`, `conf.d/` or `conf.modules.d/`. If only some of the four blocks are found, nothing is changed and it's reported as FAIL to check by hand. |
 
 The calculations, the alert rule and the save behaviour are unchanged. Nothing is customer-specific: the customer name and allocation come from each server's `contract/.data`.
 
@@ -37,6 +38,7 @@ Options:
 - `--no-run`: install only; don't run the usage check now (it runs daily at 22:00 UTC anyway).
 - `--skip-certbot`: leave the certbot line in root's crontab untouched.
 - `--skip-schedule`: leave the usage check's time in root's crontab untouched.
+- `--skip-apache`: leave `httpd.conf` untouched (no security setting).
 
 Before the first crontab change, root's crontab is backed up. After each change, the script re-reads the crontab, and if the change isn't there it puts the crontab back as it was.
 

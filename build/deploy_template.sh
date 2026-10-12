@@ -11,12 +11,15 @@
 #      minute for an hour, twice a day) to "30 4,16 * * *" (04:30 and 16:30 UTC)
 #   5. root crontab: moves the daily usage check (contractcheck.pl) to 22:00 UTC
 #      = 05:00 Thailand (UTC+7), 06:00 Malaysia / Philippines (UTC+8)
-#   6. Runs contractcheck.pl once so both pages show corrected usage now
+#   6. Apache security setting (desknet's NEO guide security_linux_setting_apache_202608):
+#      blocks HTTP access to NEO folders/files that must not be public (httpd.conf)
+#   7. Runs contractcheck.pl once so both pages show corrected usage now
 #
 # Usage (on the server):   sudo bash deploy_storage_update.sh
 #   --no-run         install only; don't run contractcheck.pl now
 #   --skip-certbot   leave the certbot line in root's crontab untouched
 #   --skip-schedule  leave the usage check's time in root's crontab untouched
+#   --skip-apache    leave httpd.conf untouched (no security setting)
 #   --dry-run        check everything and show what would change; change nothing
 #
 # Safe to run again: files already up to date and cron lines already right are skipped.
@@ -29,13 +32,15 @@ RUN_CHECK=1
 DRY_RUN=0
 FIX_CERTBOT=1
 FIX_SCHEDULE=1
+FIX_APACHE=1
 for a in "$@"; do
   case "$a" in
     --no-run)        RUN_CHECK=0 ;;
     --skip-certbot)  FIX_CERTBOT=0 ;;
     --skip-schedule) FIX_SCHEDULE=0 ;;
+    --skip-apache)   FIX_APACHE=0 ;;
     --dry-run)       DRY_RUN=1 ;;
-    -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,28p' "$0"; exit 0 ;;
     *) echo "Unknown option: $a" >&2; exit 2 ;;
   esac
 done
@@ -260,6 +265,116 @@ fix_schedule() {
 }
 if [ $FIX_SCHEDULE -eq 1 ]; then
   fix_schedule
+fi
+
+# ---- Apache security setting (security_linux_setting_apache_202608) -------------------
+# Appends the vendor's four LocationMatch blocks to the end of httpd.conf, exactly as in
+# https://www.desknets.com/neo/download/doc/install/security_linux_setting_apache_202608.html
+APACHE_BEGIN="# BEGIN desknet's NEO security setting (security_linux_setting_apache_202608)"
+APACHE_END="# END desknet's NEO security setting (security_linux_setting_apache_202608)"
+apache_block() { # apache_block <deny lines>
+  local deny=$1 re
+  echo "$APACHE_BEGIN"
+  for re in \
+    '(?i)^/cgi-bin/(?:.*/)?dneoopt(?:/|$)' \
+    '(?i)^/cgi-bin/(?:.*/)?dneo/(?:data|file|wmldata|dump|tmp|log|tools)(?:/|$)' \
+    '(?i)^/cgi-bin/(?:.*/)?dneo/(?:.*/)?[^/]+\.(?:sh|bat|cmd|ps1)(?:/.*)?$' \
+    '(?i)^/cgi-bin/(?:.*/)?dneo/(?:.*/)?(?:zbat|appsbat|dneoappconnect|dneoappperiodical|dneoapppush|wsserver)[^/]*(?:/.*)?$'; do
+    printf '<LocationMatch "%s">\n%s\n</LocationMatch>\n' "$re" "$deny"
+  done
+  echo "$APACHE_END"
+}
+# HTTP status for a path on this server, for http and https: "<http> <https>"
+http_codes() {
+  local s c out=""
+  for s in http https; do
+    c=$(curl -sk -o /dev/null --max-time 15 -w '%{http_code}' "$s://127.0.0.1$1" 2>/dev/null)
+    out="$out ${c:-000}"
+  done
+  echo $out
+}
+apache_reload() {
+  if command -v systemctl >/dev/null && systemctl is-active -q httpd 2>/dev/null; then
+    systemctl reload httpd
+  else
+    apachectl graceful
+  fi
+}
+fix_apache() {
+  local httpd root conf ver deny login_before login_after blocked_sh blocked_dir
+  httpd=$(command -v httpd || command -v apache2 || true)
+  if [ -z "$httpd" ]; then
+    skip "Apache security setting: Apache (httpd) not found"
+    return
+  fi
+  root=$("$httpd" -V 2>/dev/null | sed -n 's/.*HTTPD_ROOT="\(.*\)"/\1/p')
+  conf=$("$httpd" -V 2>/dev/null | sed -n 's/.*SERVER_CONFIG_FILE="\(.*\)"/\1/p')
+  [ "${conf:0:1}" = / ] || conf="${root:-/etc/httpd}/${conf:-conf/httpd.conf}"
+  if [ ! -f "$conf" ]; then
+    fail "Apache security setting: config file $conf not found (unchanged)"
+    return
+  fi
+  ver=$("$httpd" -v 2>/dev/null | sed -n 's#.*Apache/\([0-9]*\.[0-9]*\).*#\1#p')
+  case "$ver" in
+    2.4) deny='    Require all denied' ;;
+    2.2) deny=$'    Order Deny,Allow\n    Deny from all' ;;
+    *)   fail "Apache security setting: unsupported Apache version '${ver:-?}' (unchanged)"; return ;;
+  esac
+  # Already there? Either added by this script (markers) or by hand (the vendor's own lines).
+  if grep -qF "$APACHE_BEGIN" "$conf"; then
+    skip "Apache security setting: already in $conf"
+    return
+  fi
+  # Done by hand earlier: look for each of the vendor's four blocks anywhere in Apache's config.
+  local dirs=() d key found=0 where
+  for d in "$(dirname "$conf")" "${root:-/etc/httpd}/conf.d" "${root:-/etc/httpd}/conf.modules.d"; do
+    [ -d "$d" ] && dirs+=("$d")
+  done
+  for key in 'dneoopt(?:/|$)' '(?:data|file|wmldata|dump|tmp|log|tools)' '(?:sh|bat|cmd|ps1)' 'dneoapppush|wsserver)'; do
+    grep -rqF -- "$key" "${dirs[@]}" 2>/dev/null && found=$((found+1))
+  done
+  if [ $found -eq 4 ]; then
+    where=$(grep -rlF -- 'dneoopt(?:/|$)' "${dirs[@]}" 2>/dev/null | head -1)
+    skip "Apache security setting: already done by hand in $where, left as is"
+    return
+  elif [ $found -gt 0 ]; then
+    fail "Apache security setting: only $found of the 4 vendor blocks found in ${dirs[*]} - not changed, check it by hand"
+    return
+  fi
+  if [ $DRY_RUN -eq 1 ]; then
+    ok "Apache security setting: would add 4 blocks to the end of $conf (Apache $ver)"
+    return
+  fi
+  login_before=$(http_codes /cgi-bin/dneo/dneo.cgi)
+  backup "$conf"
+  { printf '\n'; apache_block "$deny"; } >> "$conf"
+  if ! apachectl configtest >/dev/null 2>&1; then
+    cat "$BACKUP$conf" > "$conf"
+    fail "Apache security setting: config test failed, $conf put back as it was"
+    return
+  fi
+  if ! apache_reload; then
+    cat "$BACKUP$conf" > "$conf"; apache_reload
+    fail "Apache security setting: reload failed, $conf put back as it was"
+    return
+  fi
+  sleep 2
+  # NEO must answer exactly as before; the blocked paths must now answer 403 on every scheme
+  # that answered at all. The test paths don't exist, so nothing runs if a rule didn't apply.
+  login_after=$(http_codes /cgi-bin/dneo/dneo.cgi)
+  blocked_dir=$(http_codes /cgi-bin/dneo/data/zz-security-check)
+  blocked_sh=$(http_codes /cgi-bin/dneo/zz-security-check.sh)
+  if [ "$login_after" != "$login_before" ] || [[ " $blocked_dir $blocked_sh " =~ \ (200|404)\  ]] \
+     || [[ ! " $blocked_dir " =~ \ 403\  ]] || [[ ! " $blocked_sh " =~ \ 403\  ]]; then
+    cat "$BACKUP$conf" > "$conf"; apache_reload
+    fail "Apache security setting: check failed (login $login_before -> $login_after, blocked $blocked_dir / $blocked_sh), $conf put back as it was"
+    return
+  fi
+  ROLLBACK+=("systemctl reload httpd   # after restoring httpd.conf above")
+  ok "Apache security setting: added to $conf (Apache $ver); NEO answers as before ($login_after), test paths blocked ($blocked_dir)"
+}
+if [ $FIX_APACHE -eq 1 ]; then
+  fix_apache
 fi
 
 # ---- run the usage check once ---------------------------------------------------
